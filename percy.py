@@ -191,15 +191,34 @@ def backup_dir_for(timestamp):
     return d
 
 
+def backup_path_for(src, timestamp):
+    """src 在 备份根/[备份时间戳]/ 下对应的备份文件路径。"""
+    return os.path.join(backup_dir_for(timestamp), os.path.basename(src))
+
+
 def backup_file(src, timestamp):
     """把原文件复制到 备份根/[备份时间戳]/ 下。
 
     同一批次内若目标已存在则不重复覆盖，保证一批备份只保留最初的原文件。
     """
-    target = os.path.join(backup_dir_for(timestamp), os.path.basename(src))
+    target = backup_path_for(src, timestamp)
     if not os.path.exists(target):
         shutil.copy2(src, target)
     return target
+
+
+def restore_backup(src, timestamp):
+    """把 src 还原为该批次备份的最初版本，返回是否真的还原了。
+
+    替换模式批量生成时必须先调用：否则第 N 个 d 会作用在第 N-1 个 d 的结果上，
+    而每次变换都会从面身顶部消耗 |d 的变化量| 行，变换复合后面身会被逐次吃掉。
+    还原后每个 d 都作用在最初的原文件上，与常规模式语义一致。
+    """
+    backup = backup_path_for(src, timestamp)
+    if os.path.exists(backup):
+        shutil.copy2(backup, src)
+        return True
+    return False
 
 def _read_key_from_pipe():
     """标准输入被重定向时，按行读取并取首个字符。
@@ -373,8 +392,8 @@ def report_undersized(undersized):
     """提示高度不足的图片——它们不在本程序的处理范围内。
 
     高度小于 MIN_IMAGE_HEIGHT 的图片通常是另一种面尾结构，而不是使用 Repeat
-    模式的面身文件。对这类图片做纵向复制并不能产生有效结果，所以这里只做
-    提示并返回路径输入，不做任何改动。
+    模式的面身文件。对这类图片做纵向复制并不能产生有效结果，所以这里只把它们
+    列出来并从本次处理中排除，不做任何改动。
     """
     print(f"\n{Color.WARNING}"
           + t(f"以下 {len(undersized)} 张图片高度小于 {MIN_IMAGE_HEIGHT}px，不属于本程序的处理范围：",
@@ -385,8 +404,8 @@ def report_undersized(undersized):
         print(f"  {Color.BOLD}- {os.path.basename(path)}{Color.ENDC}")
     print(t("  这类图片通常是另一种面尾结构，并不是使用 Repeat 模式的面身文件；",
             "  They are usually a different tail structure rather than a Repeat-mode note body;"))
-    print(t("  本程序只处理 Repeat 模式的面身文件，因此不会对它们做任何改动。",
-            "  this tool only handles Repeat-mode note bodies, so nothing is modified."))
+    print(t("  本程序只处理 Repeat 模式的面身文件，因此会把它们跳过，不做任何改动。",
+            "  this tool only handles Repeat-mode note bodies, so they are skipped and left untouched."))
 
 def confirm_action(prompt):
     """单键确认：按 y 确认，其他任意键（含回车）取消。"""
@@ -422,7 +441,9 @@ def emit_output(src, mode, timestamp, build_path, produce):
                     pass
         return src
     output_path = build_path()
-    if os.path.abspath(output_path) == os.path.abspath(src):
+    # normcase 而非仅 abspath：Windows 文件系统大小写不敏感，只比较 abspath 会
+    # 让 "C:\Skin" 与 "c:\skin\note1L.png" 这类只在大小写上不同的路径绕过守卫。
+    if os.path.normcase(os.path.abspath(output_path)) == os.path.normcase(os.path.abspath(src)):
         raise LNImageError(t(
             "输出路径与原文件相同（输出文件夹指向源目录且未加文件名后缀）；"
             "常规模式不会覆盖原文件，已跳过该文件。",
@@ -965,9 +986,23 @@ def main():
                 continue
             if undersized:
                 report_undersized(undersized)
-                pause()
-                clear_screen()
-                continue
+                # 只把这批图片排除掉，其余照常处理；以前是整批作废、让用户
+                # 重新走一遍路径输入与范围选择。
+                skipped = set(undersized)
+                targets = [p for p in targets if p not in skipped]
+                if not targets:
+                    print(f"\n{Color.WARNING}"
+                          + t("所选图片全部不在处理范围内，请重新选择。",
+                              "Every selected image is outside this tool's scope; please choose again.")
+                          + f"{Color.ENDC}")
+                    pause()
+                    clear_screen()
+                    continue
+                print(f"\n{Color.OKCYAN}"
+                      + t(f"已跳过上面 {len(undersized)} 张，继续处理其余 {len(targets)} 张。",
+                          f"Skipping the {len(undersized)} image(s) above; "
+                          f"continuing with the remaining {len(targets)}.")
+                      + f"{Color.ENDC}")
             current_image_path = path
             current_targets = targets
             current_source_type = source_type
@@ -1197,7 +1232,7 @@ def main():
             print(f"{Color.OKCYAN}{t('本次将使用列表: ', 'This run will use d list: ')}{d_values}{Color.ENDC}")
             if active_mode == OUTPUT_MODE_REPLACE:
                 print(f"{Color.BOLD}{Color.FAIL}{t('！！！ 警告: 当前为【替换模式】，本次生成的结果会覆盖原文件 ！！！', '!!! WARNING: Replace Mode is active - these results will overwrite the original file !!!')}{Color.ENDC}")
-                print(f"{Color.FAIL}{t('文件名保持不变；每张结果会覆盖上一张结果，备份只保留最初的原文件。', 'The filename stays the same; each result overwrites the previous one, and the backup keeps only the first original.')}{Color.ENDC}")
+                print(f"{Color.FAIL}{t('文件名保持不变；每个 d 都从最初的原文件重新生成，备份只保留最初的原文件。', 'The filename stays the same; every d is regenerated from the original file, and the backup keeps only the first original.')}{Color.ENDC}")
                 print(f"{Color.FAIL}{t('备份位置: ', 'Backup location: ')}{os.path.join(get_backup_root(), batch_timestamp)}{Color.ENDC}")
             if not confirm_action(t(f"警告: 将基于当前单图生成 {total} 张结果图。是否继续？",
                                    f"Warning: {total} images will be generated from the current source image. Continue?")):
@@ -1213,6 +1248,11 @@ def main():
             failed = 0
             errors = []
             for d_value in d_values:
+                if active_mode == OUTPUT_MODE_REPLACE:
+                    # 每个 d 都从最初的原文件生成：否则上一次替换的结果会被当作
+                    # 下一次的输入，变换复合导致面身被累计消耗（见 restore_backup）。
+                    for src in current_targets:
+                        restore_backup(src, batch_timestamp)
                 s, f, err_list, _ = process_targets(
                     current_targets,
                     d_value,

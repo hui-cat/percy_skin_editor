@@ -84,6 +84,9 @@ Details:
 - Before confirming output, Replace Mode clearly indicates the original files that are about to be overwritten and shows this run's backup path.
 - On success the backup location shown is the folder that was **actually created**: `/backup-archive/[timestamp]`.
 - A batch keeps only the very first original version: repeatedly generating from menu 4 does not overwrite the backup again.
+- During a Replace-Mode batch (menu 4), **every d is regenerated from the original file** rather than
+  applied on top of the previous result, so the output matches generating each image in Normal Mode and
+  the note body is never consumed cumulatively.
 - In Normal Mode, if the output folder is set to the source directory *and* no filename suffix is
   used, the output path would equal the original file. In that case the file is **skipped with a
   message** rather than overwriting the original.
@@ -91,8 +94,11 @@ Details:
 ### Images Shorter Than 1000px
 
 Such images are **outside this tool's scope**: they are usually a different tail structure rather
-than a Repeat-mode note body, so tiling them vertically would not achieve anything. The tool lists
-these files, explains why, and returns to the path input — it **does not modify any file**.
+than a Repeat-mode note body, so tiling them vertically would not achieve anything. The tool
+**excludes them from the current run** and explains why — it **does not modify any file**:
+
+- if other processable files were selected, it skips these and continues with the rest;
+- if every selected image is of this kind, it says so and returns to the path input so you can choose again.
 
 ### Config File
 
