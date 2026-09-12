@@ -10,6 +10,10 @@ on:
       - percy.py
       - requirements.txt
       - .github/workflows/python-app.yml
+  pull_request:
+    branches:
+      - main
+      - master
 
 jobs:
   build:

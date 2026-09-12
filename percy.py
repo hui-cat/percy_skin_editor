@@ -197,28 +197,15 @@ def backup_path_for(src, timestamp):
 
 
 def backup_file(src, timestamp):
-    """把原文件复制到 备份根/[备份时间戳]/ 下。
+    """把原文件复制到 备份根/[备份时间戳]/ 下，返回备份文件路径。
 
-    同一批次内若目标已存在则不重复覆盖，保证一批备份只保留最初的原文件。
+    同一批次内若目标已存在则不重复覆盖，保证一批备份只保留最初的原文件；
+    因此返回值在整个批次里始终指向最初的原文件。
     """
     target = backup_path_for(src, timestamp)
     if not os.path.exists(target):
         shutil.copy2(src, target)
     return target
-
-
-def restore_backup(src, timestamp):
-    """把 src 还原为该批次备份的最初版本，返回是否真的还原了。
-
-    替换模式批量生成时必须先调用：否则第 N 个 d 会作用在第 N-1 个 d 的结果上，
-    而每次变换都会从面身顶部消耗 |d 的变化量| 行，变换复合后面身会被逐次吃掉。
-    还原后每个 d 都作用在最初的原文件上，与常规模式语义一致。
-    """
-    backup = backup_path_for(src, timestamp)
-    if os.path.exists(backup):
-        shutil.copy2(backup, src)
-        return True
-    return False
 
 def _read_key_from_pipe():
     """标准输入被重定向时，按行读取并取首个字符。
@@ -426,12 +413,18 @@ def emit_output(src, mode, timestamp, build_path, produce):
 
     常规模式：写到 build_path() 指定的输出路径。
     替换模式：先把原文件备份到 备份根/[备份时间戳]/，再用结果替换原文件。
+
+    produce(out_path, in_path) 负责真正生成图片。替换模式下以**备份文件**作为输入：
+    批量生成（菜单 4）同一批次会对同一个 src 走多次 emit_output，若以 src 为输入，
+    第 N 个 d 就会作用在第 N-1 个 d 的结果上，变换复合使面身被逐次吃掉；备份始终保存
+    最初的原文件，所以每个 d 都从最初的原图开始。这样同时也省掉一次整图回拷，
+    并且 src 只经由 os.replace 原子替换，不会出现写到一半损坏原图的情况。
     """
     if mode == OUTPUT_MODE_REPLACE:
-        backup_file(src, timestamp)
+        original = backup_file(src, timestamp)
         tmp_path = src + ".percy-tmp.png"
         try:
-            produce(tmp_path)
+            produce(tmp_path, original)
             os.replace(tmp_path, src)
         finally:
             if os.path.exists(tmp_path):
@@ -450,7 +443,7 @@ def emit_output(src, mode, timestamp, build_path, produce):
             "Output path equals the source file (the output folder points at the source "
             "directory and no filename suffix is used); Normal Mode never overwrites "
             "originals, so this file was skipped."))
-    produce(output_path)
+    produce(output_path, src)
     return output_path
 
 def process_targets(targets, d_value, lzr=False, suffix=True, mode=None, timestamp=None):
@@ -470,7 +463,7 @@ def process_targets(targets, d_value, lzr=False, suffix=True, mode=None, timesta
                 mode,
                 timestamp,
                 lambda s=src: build_output_path(s, d_value, lzr=lzr, suffix=suffix),
-                lambda p, s=src: process_ln_image(s, d_value, lzr=lzr, output_path=p),
+                lambda p, i: process_ln_image(i, d_value, lzr=lzr, output_path=p),
             )
             success += 1
         except Exception as e:
@@ -494,7 +487,7 @@ def process_normalize_targets(targets, lzr=False, mode=None, timestamp=None):
                 mode,
                 timestamp,
                 lambda s=src: build_normalize_output_path(s, lzr=lzr),
-                lambda p, s=src: normalize_image_file(s, lzr=lzr, output_path=p),
+                lambda p, i: normalize_image_file(i, lzr=lzr, output_path=p),
             )
             success += 1
         except Exception as e:
@@ -1003,6 +996,9 @@ def main():
                           f"Skipping the {len(undersized)} image(s) above; "
                           f"continuing with the remaining {len(targets)}.")
                       + f"{Color.ENDC}")
+                # 下一轮 while 一进来就会 clear_screen()，不停一下的话被跳过的
+                # 文件清单会一闪而过。
+                pause()
             current_image_path = path
             current_targets = targets
             current_source_type = source_type
@@ -1248,11 +1244,6 @@ def main():
             failed = 0
             errors = []
             for d_value in d_values:
-                if active_mode == OUTPUT_MODE_REPLACE:
-                    # 每个 d 都从最初的原文件生成：否则上一次替换的结果会被当作
-                    # 下一次的输入，变换复合导致面身被累计消耗（见 restore_backup）。
-                    for src in current_targets:
-                        restore_backup(src, batch_timestamp)
                 s, f, err_list, _ = process_targets(
                     current_targets,
                     d_value,
