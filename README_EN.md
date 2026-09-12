@@ -15,22 +15,28 @@ This tool adjusts the cut-off amount at the top of the image, i.e., cut off by x
 - Supports fixing visual issues caused by excessive stretching in Lazer
 - Supports fixing the tail white-line issue in Stable
 - Supports both Normal and Replace output modes; originals are backed up automatically before replacement, making it convenient to edit existing skins directly
-- Detects and handles images shorter than 1000px automatically
+- When picking a folder you can target only the matching LN note-body files, or all images
 - Persistent configuration (output mode, output folder, backup folder, UI language)
 
 ### Requirements
 - A 64-bit Windows system (the released executables are 64-bit builds)
-- No Python or third-party dependencies required; the executables bundle the complete runtime
+- The executable bundles the complete runtime, so no Python or third-party dependencies are needed
 - Everything works offline except "Check updates", which needs access to GitHub
 
-### Build from Source / Usage
+### Usage
+
+**Option 1: download the executable (recommended)**
+
+Download `percy.exe` from the Releases page and double-click it. No Python or dependencies required.
+
+**Option 2: run from source**
 
 ```bash
 pip install -r requirements.txt
-python percy_en.py
+python percy.py
 ```
 
-`percy.py` is the same program with Chinese as the default interface language.
+Requires Python 3.8+; third-party dependencies are listed in `requirements.txt`.
 
 ### Menu and Keys
 
@@ -40,7 +46,7 @@ press one key and it runs immediately, no Enter needed.
 | Key | Function |
 |---|---|
 | `?` | Help (both the half-width `?` and the full-width `？` work) |
-| `0` | Reset default config (restart required) |
+| `0` | Reset default config (output mode and folders apply immediately; the UI language switches after a restart) |
 | `1` | Switch mode (Stable / Lazer) |
 | `2` | View current d (single image shows its own d; directory mode lists the d of every selected image) |
 | `3` | Modify d |
@@ -74,31 +80,31 @@ When several files are selected, menu `2` lists the cut-off amount of every imag
 - **Replace Mode**: before output, each selected original is copied into the backup folder (default `/backup-archive`) under a `[timestamp]` subfolder, then the output replaces the original file.
 
 Details:
-- All files in the same batch share **one backup folder**
+- All files in the same batch share **one backup folder**.
 - Before confirming output, Replace Mode clearly indicates the original files that are about to be overwritten and shows this run's backup path.
-- On success the backup location is shown as `/backup-archive/[timestamp]-replaced-file`.
-- The `-replaced-file` / `-height-adjustment` markers describe the **reason for the backup**; the real folder name is `[timestamp]`.
+- On success the backup location shown is the folder that was **actually created**: `/backup-archive/[timestamp]`.
 - A batch keeps only the very first original version: repeatedly generating from menu 4 does not overwrite the backup again.
+- In Normal Mode, if the output folder is set to the source directory *and* no filename suffix is
+  used, the output path would equal the original file. In that case the file is **skipped with a
+  message** rather than overwriting the original.
 
-### Handling Images Shorter Than 1000px
+### Images Shorter Than 1000px
 
-When an image shorter than 1000px is encountered, the tool **lists every file that needs modifying first**, then asks:
-
-- `1 - Adjust image(s) to reach 1000px`:
-  1. copy the original into `/backup-archive/[timestamp]`;
-  2. tile the image vertically, copies flush and non-overlapping;
-  3. stop once the height reaches 1000px;
-  4. the result replaces the original file;
-  5. report `Originals saved to /backup-archive/[timestamp]-height-adjustment`.
-- `2 - Go back`: return to the path input screen without changing anything.
+Such images are **outside this tool's scope**: they are usually a different tail structure rather
+than a Repeat-mode note body, so tiling them vertically would not achieve anything. The tool lists
+these files, explains why, and returns to the path input — it **does not modify any file**.
 
 ### Config File
 
-- The config file is `percy_config.json` in the program working directory; it is read at startup and **saved on exit**.
+- The config file is `percy_config.json` next to the executable (or next to the script when run from
+  source); it is read at startup and **saved on exit**.
 - If the file does not exist, a default config file is created at startup.
-- Defaults: output mode `Normal Mode`, output folder `/output`, backup folder `/backup-archive`, language `中文`.
+- Defaults: output mode `Normal Mode`, output folder `/output`, backup folder `/backup-archive`.
+- The interface language is taken from the **system UI language on first run**, and is governed by the
+  config file afterwards (changeable from menu `L`).
+- If the config file cannot be parsed, it is first renamed to `percy_config.json.bak` before the
+  defaults are written, so settings are never discarded silently.
 - A leading `/` or `\` in the output/backup folder means **relative to the program directory**; absolute paths are also accepted.
-- Menu `0 - Reset default config` requires restarting the program to take effect.
 
 ### Notes
 - Back up original files before processing (Replace Mode backs up automatically, but keeping your own copy is still recommended)

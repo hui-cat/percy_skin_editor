@@ -9,7 +9,7 @@ import requests
 from packaging.version import parse as parse_version
 from PIL import Image
 
-VERSION = "1.6.0"
+VERSION = "1.5.0"
 
 _OWNER = "LeoBlackMT"
 _REPO = "percy_skin_editor"
@@ -33,9 +33,24 @@ def language_label(lang=None):
     return "中文" if lang == "zh" else "English"
 
 
-def _entry_language(default_language=None):
-    """把入口程序传入的默认语言规范化为受支持的语言代码。"""
-    return default_language if default_language in LANGUAGES else DEFAULT_LANGUAGE
+def detect_system_language():
+    """还没有配置文件时，按系统界面语言决定默认语言。
+
+    之后一律以配置文件为准；用户也可以用菜单 L 随时切换。
+    """
+    if os.name == 'nt':
+        try:
+            import ctypes
+            # 主语言 ID 位于低 10 位；0x04 表示中文（简体/繁体均属此主语言）
+            lang_id = ctypes.windll.kernel32.GetUserDefaultUILanguage()
+            return "zh" if (lang_id & 0x3FF) == 0x04 else "en"
+        except Exception:
+            return DEFAULT_LANGUAGE
+    for var in ("LC_ALL", "LC_MESSAGES", "LANG"):
+        value = os.environ.get(var)
+        if value:
+            return "zh" if value.lower().startswith("zh") else "en"
+    return DEFAULT_LANGUAGE
 
 # ---------------- 配置持久化 ----------------
 
@@ -57,8 +72,14 @@ _CONFIG = None
 
 
 def get_base_dir():
-    """程序运行目录：配置文件与默认输出/备份目录的基准。"""
-    return os.getcwd()
+    """程序运行目录：配置文件与默认输出/备份目录的基准。
+
+    冻结成 exe 时取 exe 所在目录，直接跑源码时取脚本所在目录。
+    这样从任意工作目录启动都能读到同一份配置，设置才能跨启动留存。
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(sys.executable)
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 def get_config_path():
@@ -78,10 +99,10 @@ def save_config(cfg):
         return False
 
 
-def load_config(default_language=None):
+def load_config():
     """读取配置；若程序运行目录下不存在配置文件则自动创建默认配置文件。"""
     cfg = default_config()
-    cfg["language"] = _entry_language(default_language)
+    cfg["language"] = detect_system_language()
     path = get_config_path()
     if not os.path.isfile(path):
         save_config(cfg)
@@ -90,6 +111,11 @@ def load_config(default_language=None):
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
     except Exception:
+        # 配置损坏时先保留一份 .bak，避免用户的设置被无痕清空
+        try:
+            os.replace(path, path + ".bak")
+        except OSError:
+            pass
         save_config(cfg)
         return cfg
     if isinstance(data, dict):
@@ -100,14 +126,14 @@ def load_config(default_language=None):
     if cfg["output_mode"] not in (OUTPUT_MODE_NORMAL, OUTPUT_MODE_REPLACE):
         cfg["output_mode"] = OUTPUT_MODE_NORMAL
     if cfg["language"] not in LANGUAGES:
-        cfg["language"] = _entry_language(default_language)
+        cfg["language"] = detect_system_language()
     return cfg
 
 
-def config(default_language=None):
+def config():
     global _CONFIG
     if _CONFIG is None:
-        _CONFIG = load_config(default_language)
+        _CONFIG = load_config()
     return _CONFIG
 
 
@@ -116,10 +142,10 @@ def set_config(cfg):
     _CONFIG = cfg
 
 
-def reset_default_config(language=None):
+def reset_default_config():
     """重置为默认配置并立即写回配置文件。"""
     cfg = default_config()
-    cfg["language"] = _entry_language(language)
+    cfg["language"] = detect_system_language()
     save_config(cfg)
     set_config(cfg)
     return cfg
@@ -203,6 +229,8 @@ def read_key():
             return ''
         if ch in ('\r', '\n'):
             return ''
+        if ch == '\x03':             # getwch 下 Ctrl+C 不产生 SIGINT，需手动抛出
+            raise KeyboardInterrupt
         return ch
 
     import termios
@@ -218,6 +246,8 @@ def read_key():
         termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
     if ch in ('\r', '\n'):
         return ''
+    if ch == '\x03':                 # raw 模式下同样收不到 SIGINT，需手动抛出
+        raise KeyboardInterrupt
     return ch
 
 def clear_screen():
@@ -339,82 +369,24 @@ def find_undersized(targets):
     return undersized
 
 
-def tile_image_to_height(img, target=MIN_IMAGE_HEIGHT):
-    """纵向平铺副本（紧贴不重叠），直到高度达到 target，多余部分裁掉。"""
-    w, h = img.size
-    if h <= 0:
-        raise LNImageError(t("图片高度为 0，无法调整。", "Image height is 0 and cannot be adjusted."))
-    if h >= target:
-        return img
-    new_img = Image.new("RGBA", (w, target), (0, 0, 0, 0))
-    y = 0
-    while y < target:
-        new_img.paste(img, (0, y))
-        y += h
-    return new_img
+def report_undersized(undersized):
+    """提示高度不足的图片——它们不在本程序的处理范围内。
 
-
-def adjust_image_height(path, timestamp):
-    """备份原文件后把图片纵向平铺到 MIN_IMAGE_HEIGHT，并用结果替换原文件。"""
-    backup_file(path, timestamp)
-    with Image.open(path) as im:
-        img = im.convert("RGBA")
-    fixed = tile_image_to_height(img)
-    tmp_path = path + ".percy-tmp.png"
-    try:
-        fixed.save(tmp_path)
-        os.replace(tmp_path, path)
-    finally:
-        if os.path.exists(tmp_path):
-            try:
-                os.remove(tmp_path)
-            except OSError:
-                pass
-
-
-def handle_undersized(undersized):
-    """处理高度不足的图片。返回 True 表示继续，False 表示返回文件选择界面。"""
+    高度小于 MIN_IMAGE_HEIGHT 的图片通常是另一种面尾结构，而不是使用 Repeat
+    模式的面身文件。对这类图片做纵向复制并不能产生有效结果，所以这里只做
+    提示并返回路径输入，不做任何改动。
+    """
     print(f"\n{Color.WARNING}"
-          + t(f"检测到 {len(undersized)} 张图片高度小于 {MIN_IMAGE_HEIGHT}px，低于该高度可能无法正确识别结构：",
-              f"Detected {len(undersized)} image(s) shorter than {MIN_IMAGE_HEIGHT}px; "
-              f"structure detection may fail below that height:")
+          + t(f"以下 {len(undersized)} 张图片高度小于 {MIN_IMAGE_HEIGHT}px，不属于本程序的处理范围：",
+              f"The {len(undersized)} image(s) below are shorter than {MIN_IMAGE_HEIGHT}px "
+              f"and are outside this tool's scope:")
           + f"{Color.ENDC}")
     for path in undersized:
-        print(f"  {Color.BOLD}- {path}{Color.ENDC}")
-    print(f"\n{Color.OKBLUE}{t('请选择操作:', 'Select an action:')}{Color.ENDC}")
-    print(t("  1 - 调整图片使其达到 1000px（原文件先备份，结果替换原文件）",
-            "  1 - Adjust image(s) to reach 1000px (originals are backed up first, results replace them)"))
-    print(t("  2 - 返回", "  2 - Go back"))
-    print("> ", end='', flush=True)
-    ans = read_key().strip()
-    print(ans)
-    if ans != '1':
-        return False
-
-    timestamp = make_timestamp()
-    done = 0
-    errors = []
-    for path in undersized:
-        try:
-            adjust_image_height(path, timestamp)
-            done += 1
-        except Exception as e:
-            errors.append((path, str(e)))
-
-    backup_label = os.path.join(get_backup_root(), f"{timestamp}-height-adjustment")
-    if errors:
-        print(f"{Color.WARNING}"
-              + t(f"调整结束：成功 {done} 张，失败 {len(errors)} 张。",
-                  f"Adjustment finished: {done} succeeded, {len(errors)} failed.")
-              + f"{Color.ENDC}")
-        for path, err in errors:
-            print(f"{Color.FAIL}{t('失败: ', 'Failed: ')}{path} -> {err}{Color.ENDC}")
-    else:
-        print(f"{Color.OKGREEN}"
-              + t(f"图片已成功调整，原文件已保存至 {backup_label}",
-                  f"Image(s) adjusted successfully. Originals saved to {backup_label}")
-              + f"{Color.ENDC}")
-    return True
+        print(f"  {Color.BOLD}- {os.path.basename(path)}{Color.ENDC}")
+    print(t("  这类图片通常是另一种面尾结构，并不是使用 Repeat 模式的面身文件；",
+            "  They are usually a different tail structure rather than a Repeat-mode note body;"))
+    print(t("  本程序只处理 Repeat 模式的面身文件，因此不会对它们做任何改动。",
+            "  this tool only handles Repeat-mode note bodies, so nothing is modified."))
 
 def confirm_action(prompt):
     """单键确认：按 y 确认，其他任意键（含回车）取消。"""
@@ -450,6 +422,13 @@ def emit_output(src, mode, timestamp, build_path, produce):
                     pass
         return src
     output_path = build_path()
+    if os.path.abspath(output_path) == os.path.abspath(src):
+        raise LNImageError(t(
+            "输出路径与原文件相同（输出文件夹指向源目录且未加文件名后缀）；"
+            "常规模式不会覆盖原文件，已跳过该文件。",
+            "Output path equals the source file (the output folder points at the source "
+            "directory and no filename suffix is used); Normal Mode never overwrites "
+            "originals, so this file was skipped."))
     produce(output_path)
     return output_path
 
@@ -786,14 +765,14 @@ def print_help():
   - Replace Mode: before processing, each selected original is copied into the backup
     folder (default /backup-archive) under a [timestamp] subfolder, then the result
     replaces the original file.
-    All files in the same batch share one timestamp folder.
-    The -replaced-file / -height-adjustment markers in messages only describe the
-    reason for the backup; the real folder name is [timestamp].
+    All files in the same batch share one timestamp folder, and the path reported on
+    success is the folder that was actually created.
 {Color.OKCYAN}[Menu Description]{Color.ENDC}
   The menu is single-key: press one key and it runs immediately, no Enter needed.
   - ? - Help: Show this help page (both the half-width ? and the full-width ？ work).
   - 0 - Reset Default Config: restore the output mode, output folder, backup folder and
-    language to defaults. A restart is required.
+    language to defaults. Output mode and folders apply immediately; the UI language
+    switches after a restart.
   - 1 - Switch Mode: Toggle between Stable and Lazer.
     Note: In Lazer mode, the minimum d is 75.
   - 2 - View Current d: In single-image mode it shows that image's d; in directory mode
@@ -830,23 +809,22 @@ def print_help():
   - 2 - All image files in that directory
   Pressing Enter returns to the path input.
 {Color.OKCYAN}[Images Shorter Than 1000px]{Color.ENDC}
-  When an image shorter than 1000px is found, the tool lists those files and asks:
-  - 1 - Adjust image(s) to reach 1000px: the original is copied into the [timestamp]
-    folder first, then the image is tiled vertically (copies flush, no overlap) up to
-    1000px and the result replaces the original; the tool then reports
-    "Originals saved to [timestamp]-height-adjustment".
-  - 2 - Go back: return to the path input screen without changing anything.
+  Such images are outside this tool's scope. They are usually a different tail structure
+  rather than a Repeat-mode note body, so tiling them vertically would not achieve
+  anything. The tool lists them, explains this, and returns to the path input without
+  modifying any file.
 {Color.OKCYAN}[Config File]{Color.ENDC}
-  - The config file is {CONFIG_FILENAME} in the program working directory; it is read at
-    startup and saved on exit.
+  - The config file is {CONFIG_FILENAME} next to the executable (or next to the script when
+    run from source); it is read at startup and saved on exit.
   - If the file does not exist, a default config file is created at startup.
-  - Defaults: output mode Normal Mode, output folder /output, backup folder /backup-archive,
-    language 中文.
+  - Defaults: output mode Normal Mode, output folder /output, backup folder /backup-archive.
+    The language follows the system UI language on first run, and is stored in the config
+    afterwards.
   - A leading / or \\ in the output/backup folder means "relative to the program directory".
 {Color.OKCYAN}[Notes]{Color.ENDC}
   1. PNG only (RGBA). Background color is the top-left pixel.
-  2. Height must be at least 1000px, otherwise structure detection may fail
-     (the tool offers to adjust such images).
+  2. Height must be at least 1000px. Shorter images are a different tail structure and
+     are out of scope; the tool lists them and returns to the path input.
   3. In Normal Mode, output goes to the output folder with filename format:
       original-name-dpx.png       (Stable)
       original-name-dpx-lzr.png   (Lazer)
@@ -878,14 +856,12 @@ def print_help():
   • 常规模式 : 默认模式。处理结果输出到输出文件夹（默认 /output），不改动原文件。
   • 替换模式 : 处理前先把所选原文件复制到备份文件夹（默认 /backup-archive）下的
               [备份时间戳] 子文件夹，随后用处理结果替换原文件。
-              同一批处理的文件共用同一个时间戳文件夹。
-              提示中的 -replaced-file / -height-adjustment 是备份原因标记，
-              实际文件夹名为 [备份时间戳]。
+              同一批处理的文件共用同一个时间戳文件夹，提示中给出的就是实际创建的路径。
 {Color.OKCYAN}【菜单说明】{Color.ENDC}
   菜单为单键触发：按一个键立即执行，无需回车。
   • ? - 帮助 : 显示本说明页（半角 ? 与全角 ？ 均可触发）。
-  • 0 - 重置默认配置 : 把输出模式、输出文件夹、备份文件夹、语言恢复为默认值，
-                       需要重启程序才会生效。
+  • 0 - 重置默认配置 : 把输出模式、输出文件夹、备份文件夹、语言恢复为默认值；
+                       输出模式与文件夹立即生效，界面语言在重启后切换。
   • 1 - 切换模式 : 在 Stable 和 Lazer 之间切换。注意 Lazer 模式下 d 最小为 75。
   • 2 - 查看当前投机取巧程度 : 单图模式显示该图的 d；目录模式会逐张列出所有已选图片的 d。
   • 3 - 修改投机取巧程度 :
@@ -915,19 +891,19 @@ def print_help():
   • 2 - 修改该目录下的全部图片文件
   直接回车则返回路径输入。
 {Color.OKCYAN}【高度小于 1000px 的图片】{Color.ENDC}
-  处理到高度小于 1000px 的图片时，程序会列出这些文件名并让你选择：
-  • 1 - 调整图片使其达到 1000px : 先把原文件复制到 [备份时间戳] 文件夹，再把图片纵向
-        复制（副本紧贴不重叠）到 1000px，输出结果替换原文件；随后提示
-        图片已成功调整，原文件已保存至 [备份时间戳]-height-adjustment。
-  • 2 - 返回 : 回到文件选择输入界面，不做任何改动。
+  这类图片不在本程序的处理范围内：它们通常是另一种面尾结构，而不是使用 Repeat 模式的
+  面身文件，对它们做纵向复制并不能产生有效结果。程序会列出这些文件并说明原因，
+  然后返回路径输入，不会对任何文件做改动。
 {Color.OKCYAN}【配置文件】{Color.ENDC}
-  • 配置文件为程序运行目录下的 {CONFIG_FILENAME}，启动时读取、退出时保存。
+  • 配置文件为 exe（源码运行时为脚本）所在目录下的 {CONFIG_FILENAME}，启动时读取、退出时保存。
   • 若该文件不存在，启动时会自动创建默认配置文件。
-  • 默认值：输出模式 常规模式，输出文件夹 /output，备份文件夹 /backup-archive，语言 中文。
+  • 默认值：输出模式 常规模式，输出文件夹 /output，备份文件夹 /backup-archive。
+    界面语言在首次运行时按系统界面语言确定，之后以配置文件为准。
   • 输出文件夹、备份文件夹以 / 或 \\ 开头表示相对于程序运行目录。
 {Color.OKCYAN}【注意事项】{Color.ENDC}
   1. 仅支持 PNG 图片（RGBA 模式），背景色以左上角第一个像素为准。
-  2. 图片高度不得小于 1000 像素，否则可能无法正确识别结构（可按提示调整）。
+  2. 图片高度不得小于 1000 像素。低于该高度的是另一种面尾结构，不在处理范围内；
+     程序会列出这些文件并返回路径输入。
   3. 常规模式输出到输出文件夹，命名格式为：
       原文件名-新d值px.png      （Stable模式）
       原文件名-新d值px-lzr.png  （Lazer 模式）
@@ -946,10 +922,10 @@ def print_help():
 
 
 
-def main(default_language=DEFAULT_LANGUAGE):
+def main():
     global LANG
-    cfg = config(default_language)
-    LANG = cfg.get("language", _entry_language(default_language))
+    cfg = config()
+    LANG = cfg.get("language", DEFAULT_LANGUAGE)
     clear_screen()
     print(f"{Color.BOLD}{Color.HEADER}osu!mania {t('投皮调整工具', 'Percy Skin Editor')} - v{VERSION}{Color.ENDC}")
     print(f"{Color.BOLD}{Color.HEADER}{t('作者: Leo_Black', 'Author: Leo_Black')}{Color.ENDC}")
@@ -988,9 +964,10 @@ def main(default_language=DEFAULT_LANGUAGE):
                 print(f"{Color.FAIL}{e}{Color.ENDC}")
                 continue
             if undersized:
-                if not handle_undersized(undersized):
-                    clear_screen()
-                    continue
+                report_undersized(undersized)
+                pause()
+                clear_screen()
+                continue
             current_image_path = path
             current_targets = targets
             current_source_type = source_type
@@ -1041,13 +1018,17 @@ def main(default_language=DEFAULT_LANGUAGE):
             print(f"  {t('输出模式  ', 'Output mode  ')}: {output_mode_label(OUTPUT_MODE_NORMAL)}")
             print(f"  {t('输出文件夹', 'Output folder')}: {DEFAULT_CONFIG['output_dir']}")
             print(f"  {t('备份文件夹', 'Backup folder')}: {DEFAULT_CONFIG['backup_dir']}")
-            print(f"  {t('语言      ', 'Language     ')}: {language_label(_entry_language(default_language))}")
+            print(f"  {t('语言      ', 'Language     ')}: {language_label(detect_system_language())}")
             if not confirm_action(t("确认重置默认配置？", "Reset to default config?")):
                 clear_screen()
                 continue
-            reset_default_config(default_language)
+            reset_default_config()
             print(f"{Color.OKGREEN}{t('配置已重置为默认值。', 'Config has been reset to defaults.')}{Color.ENDC}")
-            print(f"{Color.WARNING}{t('请重启程序以使新配置生效。', 'Please restart the program for it to take effect.')}{Color.ENDC}")
+            print(f"{Color.WARNING}"
+                  + t("输出模式与文件夹已立即生效；界面语言将在重启后切换。",
+                      "Output mode and folders take effect immediately; "
+                      "the UI language switches after a restart.")
+                  + f"{Color.ENDC}")
             pause()
             clear_screen()
         elif choice == '1':
@@ -1155,7 +1136,7 @@ def main(default_language=DEFAULT_LANGUAGE):
                 )
 
                 if active_mode == OUTPUT_MODE_REPLACE:
-                    backup_label = os.path.join(get_backup_root(), f"{timestamp}-replaced-file")
+                    backup_label = os.path.join(get_backup_root(), timestamp)
                     if failed == 0:
                         print(f"{Color.OKGREEN}{t('替换完成，共 ', 'Replaced ')}{success}{t(' 张。原文件已保存至 ', ' file(s). Originals saved to ')}{backup_label}{Color.ENDC}")
                     else:
@@ -1243,7 +1224,7 @@ def main(default_language=DEFAULT_LANGUAGE):
                 failed += f
                 errors.extend(err_list)
 
-            backup_label = os.path.join(get_backup_root(), f"{batch_timestamp}-replaced-file")
+            backup_label = os.path.join(get_backup_root(), batch_timestamp)
             if failed == 0:
                 if active_mode == OUTPUT_MODE_REPLACE:
                     print(f"{Color.OKGREEN}{t('批量生成完成，共 ', 'Batch generation completed. ')}{success}{t(' 张。原文件已保存至 ', ' result(s) written. Originals saved to ')}{backup_label}{Color.ENDC}")
@@ -1292,7 +1273,7 @@ def main(default_language=DEFAULT_LANGUAGE):
                     timestamp=fix_timestamp
                 )
 
-                backup_label = os.path.join(get_backup_root(), f"{fix_timestamp}-replaced-file")
+                backup_label = os.path.join(get_backup_root(), fix_timestamp)
                 if active_mode == OUTPUT_MODE_REPLACE:
                     if failed == 0:
                         print(f"{Color.OKGREEN}{fix_label}{t('完成，共 ', ' completed on ')}{success}{t(' 张。原文件已保存至 ', ' file(s). Originals saved to ')}{backup_label}{Color.ENDC}")
