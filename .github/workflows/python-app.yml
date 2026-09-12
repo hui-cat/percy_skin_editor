@@ -9,7 +9,7 @@ on:
     paths:
       - percy.py
       - requirements.txt
-      - .github/workflows/build-exe.yml
+      - .github/workflows/python-app.yml
 
 jobs:
   build:
