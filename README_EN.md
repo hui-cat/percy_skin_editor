@@ -105,12 +105,17 @@ than a Repeat-mode note body, so tiling them vertically would not achieve anythi
 - The config file is `percy_config.json` next to the executable (or next to the script when run from
   source); it is read at startup and **saved on exit**.
 - If the file does not exist, a default config file is created at startup.
-- Defaults: output mode `Normal Mode`, output folder `/output`, backup folder `/backup-archive`.
+- Defaults: output mode `Normal Mode`, output folder `/output`, backup folder `/backup-archive`
+  (on Windows; on other platforms these defaults are the relative names `output` / `backup-archive`,
+  because `/output` is an absolute path under the filesystem root on POSIX).
 - The interface language is taken from the **system UI language on first run**, and is governed by the
-  config file afterwards (changeable from menu `L`).
-- If the config file cannot be parsed, it is first renamed to `percy_config.json.bak` before the
-  defaults are written, so settings are never discarded silently.
-- A leading `/` or `\` in the output/backup folder means **relative to the program directory**; absolute paths are also accepted.
+  config file afterwards (changeable from menu `L`, or forced at startup with the
+  `--lang zh|en` command-line option, which also works before a config file exists).
+- If the config file cannot be parsed, or parses but is not a JSON object, it is first renamed to
+  `percy_config.json.bak` before the defaults are written, so settings are never discarded silently.
+- On **Windows** a leading `/` or `\` in the output/backup folder means **relative to the program
+  directory**; absolute paths are also accepted. On other platforms a leading `/` is an ordinary
+  absolute path and is left alone.
 
 ### Notes
 - Back up original files before processing (Replace Mode backs up automatically, but keeping your own copy is still recommended)

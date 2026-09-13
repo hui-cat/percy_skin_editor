@@ -63,8 +63,10 @@ MIN_IMAGE_HEIGHT = 1000
 
 DEFAULT_CONFIG = {
     "output_mode": OUTPUT_MODE_NORMAL,
-    "output_dir": "/output",
-    "backup_dir": "/backup-archive",
+    # /output 这种带前导斜杠的写法是「相对程序目录」的约定，只有 Windows 适用；
+    # 在 POSIX 上 /output 会被当成根目录下的绝对路径，所以改用相对目录名。
+    "output_dir": "/output" if os.name == "nt" else "output",
+    "backup_dir": "/backup-archive" if os.name == "nt" else "backup-archive",
     "language": DEFAULT_LANGUAGE,
 }
 
@@ -123,6 +125,15 @@ def load_config():
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 cfg[key] = value.strip()
+    else:
+        # 能解析成 JSON 但不是对象（数组 / 字符串 / 数字）：同样先留一份 .bak，
+        # 否则退出时写回默认配置会把用户原来的内容静默覆盖掉。
+        try:
+            os.replace(path, path + ".bak")
+        except OSError:
+            pass
+        save_config(cfg)
+        return cfg
     if cfg["output_mode"] not in (OUTPUT_MODE_NORMAL, OUTPUT_MODE_REPLACE):
         cfg["output_mode"] = OUTPUT_MODE_NORMAL
     if cfg["language"] not in LANGUAGES:
@@ -158,11 +169,16 @@ def output_mode_label(mode=None):
 
 
 def resolve_dir(path):
-    """解析目录配置：单个前导 / 或 \\ 表示相对程序运行目录。"""
+    """解析目录配置。
+
+    单个前导 / 或 \\ 表示相对程序所在目录 —— 这是本程序的约定，只在 Windows 上
+    成立（那里 "/output" 不是有效的绝对路径）。其他平台上 / 开头就是普通的绝对
+    路径，不能再改写，否则 /home/me/out 会被悄悄变成 <程序目录>/home/me/out。
+    """
     if not path or not str(path).strip():
         return get_base_dir()
     p = str(path).strip()
-    if len(p) > 1 and p[0] in "/\\" and p[1] not in "/\\":
+    if os.name == "nt" and len(p) > 1 and p[0] in "/\\" and p[1] not in "/\\":
         p = p[1:]
     if os.path.isabs(p):
         return os.path.normpath(p)
@@ -181,8 +197,28 @@ def get_backup_root():
     return d
 
 
+_USED_TIMESTAMPS = set()
+
+
 def make_timestamp():
-    return datetime.now().strftime("%Y%m%d-%H%M%S")
+    """批次备份文件夹名。
+
+    精确到微秒：只用秒级精度时，同一秒内的两次替换会落进同一个文件夹，而
+    backup_file 是「目标已存在就跳过」，于是第二次被覆盖的那一版不会留下备份。
+    批次内的文件仍然共用一个时间戳（整个批次只调用一次）。
+
+    有些平台 datetime.now() 的时钟粒度较粗，可能连续返回同一个值，所以再记一份
+    本进程已用过的名字兜底。
+    """
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    if stamp in _USED_TIMESTAMPS:
+        base = stamp
+        seq = 2
+        while stamp in _USED_TIMESTAMPS:
+            stamp = "%s-%d" % (base, seq)
+            seq += 1
+    _USED_TIMESTAMPS.add(stamp)
+    return stamp
 
 
 def backup_dir_for(timestamp):
@@ -308,7 +344,7 @@ def choose_dir_targets(pngs):
 
     返回 (targets, proceed)；proceed 为 False 表示返回上一级路径输入。
     """
-    matched, _others = split_ln_targets(pngs)
+    matched = split_ln_targets(pngs)[0]
     print(f"\n{Color.OKCYAN}{t('【目录扫描结果】', '[Directory scan]')}{Color.ENDC}")
     if matched:
         print(t(f"匹配到 {len(matched)} 个 LN 面身文件（mania-note[数字]L / NoteImage*L）:",
@@ -363,15 +399,19 @@ def collect_png_targets(path):
     raise LNImageError(t("路径不存在，请重新输入。", "Path does not exist. Please try again."))
 
 def find_undersized(targets):
-    """返回高度小于 MIN_IMAGE_HEIGHT 的图片路径列表。"""
+    """返回高度小于 MIN_IMAGE_HEIGHT 的图片路径列表。
+
+    打不开的文件不在这里报错：它们会在处理阶段被逐文件捕获并计入失败，
+    这样一个损坏的 PNG 不会像以前那样把整批选择作废。
+    """
     undersized = []
     for path in targets:
         try:
             with Image.open(path) as tmp:
                 if tmp.height < MIN_IMAGE_HEIGHT:
                     undersized.append(path)
-        except Exception as e:
-            raise LNImageError(f"{t('无法打开图片 ', 'Cannot open image ')}{path}: {e}")
+        except Exception:
+            continue
     return undersized
 
 
@@ -497,7 +537,7 @@ def process_normalize_targets(targets, lzr=False, mode=None, timestamp=None):
 
 def build_d_values(start_value, end_value, step):
     if step == 0:
-        raise LNImageError("步长不能为 0。")
+        raise LNImageError(t("步长不能为 0。", "Step cannot be 0."))
     if start_value <= end_value:
         return list(range(start_value, end_value + 1, step))
     return list(range(start_value, end_value - 1, -step))
@@ -757,88 +797,216 @@ def process_ln_image(image_path, user_d, lzr=False, output_path=None):
         new_img.save(output_path)
     return new_img
 
-def print_help():
-    if LANG == "en":
-        help_text = f"""
-{Color.BOLD}{Color.OKGREEN}========== Help Information =========={Color.ENDC}
+# 帮助页正文：每项是一对 (中文, English) 的逻辑块，渲染时逐块交给 t() 选择。
+# 两种语言的折行位置不同，所以按逻辑块（小节 / 菜单项）配对而不是硬凑成一一对应的
+# 物理行 —— 那样得为对齐塞进大量空行，反而更难维护。
+HELP_TEXT = (
+    # 标题 + 什么是投皮
+    (
+        f"""{Color.BOLD}{Color.OKGREEN}========== 帮助信息 =========={Color.ENDC}
+{Color.OKCYAN}【什么是投皮】{Color.ENDC}
+  • 投皮是一个将面身拉伸到上万像素长，随后通过顶部截断的方式来制造视觉上的短尾效果。
+  • 在高密度LN中，玩家通常会使用投皮来获得更好的视觉反馈和操作体验。
+  • 投皮往往能够大幅减轻读谱压力，但是无法精确地找到松手位置。
+  • 我们约定，一个皮肤顶部截断了多少像素(即第一个非背景色像素到顶部的距离)，称为"投机取巧程度"或"投了多少像素"。
+  • 在本程序中，使用 d 来代替这个值。""",
+        f"""{Color.BOLD}{Color.OKGREEN}========== Help Information =========={Color.ENDC}
 {Color.OKCYAN}[What Is Percy]{Color.ENDC}
   - Percy stretches a note body to an extremely long image, then creates a short-tail
     visual effect by clipping from the top.
   - In high-density LN charts, many players use percy skins for better readability.
   - Percy can reduce reading pressure, but cannot provide precise release timing.
   - We define the distance from the first non-background pixel to the top as the
-    cut-off amount, also called d in this program.
-{Color.OKCYAN}[Mode Explanation]{Color.ENDC}
+    cut-off amount, also called d in this program.""",
+    ),
+    # 模式说明
+    (
+        f"""{Color.OKCYAN}【模式说明】{Color.ENDC}
+  • Stable 模式 : 直接设置新的 d 值，程序自动移动面尾和面身。
+  • Lazer 模式 : 根据我的测定，26年初的lazer版本会使皮肤错误拉伸。大致为stb+75px。
+                因此，该模式下输入的任何数据都会被-75px，下限为0.
+                另外，为防止过度拉伸，所有图片长度将被固定在32800px。""",
+        f"""{Color.OKCYAN}[Mode Explanation]{Color.ENDC}
   - Stable Mode: Set a new d directly. The tool moves tail and body automatically.
   - Lazer Mode: Based on measurements, early-2026 lazer may stretch by roughly +75px.
     So in this mode, user input is converted by minus 75 (with lower bound 0).
-    Also, output height is normalized to 32800px.
-{Color.OKCYAN}[Output Mode Explanation]{Color.ENDC}
-  - Normal Mode: default. Results are written to the output folder (default /output);
+    Also, output height is normalized to 32800px.""",
+    ),
+    # 输出模式说明
+    (
+        f"""{Color.OKCYAN}【输出模式说明】{Color.ENDC}
+  • 常规模式 : 默认模式。处理结果输出到输出文件夹（默认 {DEFAULT_CONFIG['output_dir']}），不改动原文件。
+  • 替换模式 : 处理前先把所选原文件复制到备份文件夹（默认 {DEFAULT_CONFIG['backup_dir']}）下的
+              [备份时间戳] 子文件夹，随后用处理结果替换原文件。
+              同一批处理的文件共用同一个时间戳文件夹，提示中给出的就是实际创建的路径。""",
+        f"""{Color.OKCYAN}[Output Mode Explanation]{Color.ENDC}
+  - Normal Mode: default. Results are written to the output folder (default {DEFAULT_CONFIG['output_dir']});
     original files are never modified.
   - Replace Mode: before processing, each selected original is copied into the backup
-    folder (default /backup-archive) under a [timestamp] subfolder, then the result
+    folder (default {DEFAULT_CONFIG['backup_dir']}) under a [timestamp] subfolder, then the result
     replaces the original file.
     All files in the same batch share one timestamp folder, and the path reported on
-    success is the folder that was actually created.
-{Color.OKCYAN}[Menu Description]{Color.ENDC}
-  The menu is single-key: press one key and it runs immediately, no Enter needed.
-  - ? - Help: Show this help page (both the half-width ? and the full-width ？ work).
-  - 0 - Reset Default Config: restore the output mode, output folder, backup folder and
+    success is the folder that was actually created.""",
+    ),
+    # 菜单说明
+    (
+        f"""{Color.OKCYAN}【菜单说明】{Color.ENDC}
+  菜单为单键触发：按一个键立即执行，无需回车。""",
+        f"""{Color.OKCYAN}[Menu Description]{Color.ENDC}
+  The menu is single-key: press one key and it runs immediately, no Enter needed.""",
+    ),
+    (
+        "  • ? - 帮助 : 显示本说明页（半角 ? 与全角 ？ 均可触发）。",
+        "  - ? - Help: Show this help page (both the half-width ? and the full-width ？ work).",
+    ),
+    (
+        """  • 0 - 重置默认配置 : 把输出模式、输出文件夹、备份文件夹、语言恢复为默认值；
+                       输出模式与文件夹立即生效，界面语言在重启后切换。""",
+        """  - 0 - Reset Default Config: restore the output mode, output folder, backup folder and
     language to defaults. Output mode and folders apply immediately; the UI language
-    switches after a restart.
-  - 1 - Switch Mode: Toggle between Stable and Lazer.
-    Note: In Lazer mode, the minimum d is 75.
-  - 2 - View Current d: In single-image mode it shows that image's d; in directory mode
-    it lists the d of every selected image, one per line.
-  - 3 - Modify d:
+    switches after a restart.""",
+    ),
+    (
+        "  • 1 - 切换模式 : 在 Stable 和 Lazer 之间切换。注意 Lazer 模式下 d 最小为 75。",
+        """  - 1 - Switch Mode: Toggle between Stable and Lazer.
+    Note: In Lazer mode, the minimum d is 75.""",
+    ),
+    (
+        "  • 2 - 查看当前投机取巧程度 : 单图模式显示该图的 d；目录模式会逐张列出所有已选图片的 d。",
+        """  - 2 - View Current d: In single-image mode it shows that image's d; in directory mode
+    it lists the d of every selected image, one per line.""",
+    ),
+    (
+        """  • 3 - 修改投机取巧程度 :
+        单图模式会输出 1 张结果图；目录模式会对已选文件进行同一 d 的批处理。
+        常规模式下输入 d 值后可选择是否为输出文件名添加后缀，随后会再确认一次；
+        替换模式下文件名不变，因此不再询问后缀。
+        替换模式在确认前会用醒目红色警告提示将覆盖原文件。""",
+        """  - 3 - Modify d:
     Single-image mode outputs one image.
     Directory mode applies the same d to all selected files in that directory.
     In Normal Mode you may choose whether to add a suffix to the output filename;
     in Replace Mode the filename never changes, so no suffix is asked.
-    Replace Mode shows a bold red warning that originals will be overwritten.
-  - 4 - Single-Image Batch Generation:
+    Replace Mode shows a bold red warning that originals will be overwritten.""",
+    ),
+    (
+        """  • 4 - 单图批量生成 :
+        仅单图模式可用。输入起始值、终止值、步长生成列表后，会按其逐个生成多张图。
+        步长不能为 0；若数量较多会再次提示确认。
+        替换模式下多次生成共用同一个备份时间戳，备份只保留最初的原文件。""",
+        """  - 4 - Single-Image Batch Generation:
     Only available in single-image mode.
     Input start, end, and step to generate a d list, then output one image per d.
     Step cannot be 0; for large counts there is an extra confirmation.
     In Replace Mode all generations share one backup timestamp, so the backup keeps
-    only the very first original.
-  - 5 - Mode Fix Tool:
+    only the very first original.""",
+    ),
+    (
+        """  • 5 - 模式修复功能 :
+      Lazer 模式显示为“图片拉伸修复”，会执行 Lazer 标准化（固定到 32800px）。
+      Stable 模式显示为“修复面尾白线”，会执行 Stable 标准化（超过 32767px 时裁切并清空末行）。""",
+        """  - 5 - Mode Fix Tool:
     In Lazer mode, this shows "Stretch Repair" and runs Lazer normalization (fixed to 32800px).
     In Stable mode, this shows "Fix Tail White Line" and runs Stable normalization
-    (crop if over 32767px and clear the last row).
-  - 6 - Adjust Output Mode: Switch between Normal Mode and Replace Mode. The current
-    output mode is always shown above the menu.
-  - 7 - Adjust Output/Backup Folder: Choose whether to adjust the output folder or the
-    backup folder, then enter a new path. Leaving the input empty returns to the menu.
-  - 8 - Switch Image: Select a new PNG or directory path.
-  - 9 - Check Updates: Query latest release info from GitHub.
-  - L - Language/语言: Switch the interface language (中文 / English). Leaving the input
-    empty returns to the menu; the choice is saved to the config file.
-  - Q - Quit: Save the config and exit the program.
-{Color.OKCYAN}[Selecting a Directory]{Color.ENDC}
+    (crop if over 32767px and clear the last row).""",
+    ),
+    (
+        "  • 6 - 调整输出模式 : 在 常规模式 与 替换模式 之间切换；菜单上方始终显示当前输出模式。",
+        """  - 6 - Adjust Output Mode: Switch between Normal Mode and Replace Mode. The current
+    output mode is always shown above the menu.""",
+    ),
+    (
+        """  • 7 - 调整输出/备份文件夹 : 先选择“输出文件夹”还是“备份文件夹”，再输入新路径；
+       留空（直接回车）即可返回上级菜单。""",
+        """  - 7 - Adjust Output/Backup Folder: Choose whether to adjust the output folder or the
+    backup folder, then enter a new path. Leaving the input empty returns to the menu.""",
+    ),
+    (
+        "  • 8 - 更换图片 : 重新选择单个 PNG 或文件夹路径。",
+        "  - 8 - Switch Image: Select a new PNG or directory path.",
+    ),
+    (
+        "  • 9 - 检查更新 : 从 GitHub 获取最新发布版本信息。",
+        "  - 9 - Check Updates: Query latest release info from GitHub.",
+    ),
+    (
+        """  • L - 语言/Language : 切换界面语言（中文 / English）；留空（直接回车）即可返回上级菜单，
+        设置会保存到配置文件。""",
+        """  - L - Language/语言: Switch the interface language (中文 / English). Leaving the input
+    empty returns to the menu; the choice is saved to the config file.""",
+    ),
+    (
+        "  • Q - 退出 : 保存配置并关闭程序。",
+        "  - Q - Quit: Save the config and exit the program.",
+    ),
+    # 选择文件夹时
+    (
+        f"""{Color.OKCYAN}【选择文件夹时】{Color.ENDC}
+  选择文件夹后，程序会先列出命名匹配 mania-note[数字]L 或 NoteImage*L 的文件，
+  再让你选择修改范围：
+  • 1 - 仅修改上面列出的匹配文件
+  • 2 - 修改该目录下的全部图片文件
+  直接回车则返回路径输入。""",
+        f"""{Color.OKCYAN}[Selecting a Directory]{Color.ENDC}
   When a directory is chosen, files named like mania-note<digit>L or NoteImage*L are
   listed first, then you pick the scope:
   - 1 - Only the matched files listed above
   - 2 - All image files in that directory
-  Pressing Enter returns to the path input.
-{Color.OKCYAN}[Images Shorter Than 1000px]{Color.ENDC}
+  Pressing Enter returns to the path input.""",
+    ),
+    # 高度小于 1000px
+    (
+        f"""{Color.OKCYAN}【高度小于 1000px 的图片】{Color.ENDC}
+  这类图片不在本程序的处理范围内：它们通常是另一种面尾结构，而不是使用 Repeat 模式的
+  面身文件，对它们做纵向复制并不能产生有效结果。程序会把它们从本次处理中排除并说明原因，
+  不会对任何文件做改动；若所选图片全部属于这一类，则返回路径输入重新选择。""",
+        f"""{Color.OKCYAN}[Images Shorter Than 1000px]{Color.ENDC}
   Such images are outside this tool's scope. They are usually a different tail structure
   rather than a Repeat-mode note body, so tiling them vertically would not achieve
-  anything. The tool lists them, explains this, and returns to the path input without
-  modifying any file.
-{Color.OKCYAN}[Config File]{Color.ENDC}
+  anything. The tool excludes them from the run and explains why, leaving every file
+  untouched; if every selected image is like this, it returns to the path input.""",
+    ),
+    # 配置文件
+    (
+        f"""{Color.OKCYAN}【配置文件】{Color.ENDC}
+  • 配置文件为 exe（源码运行时为脚本）所在目录下的 {CONFIG_FILENAME}，启动时读取、退出时保存。
+  • 若该文件不存在，启动时会自动创建默认配置文件。
+  • 默认值：输出模式 常规模式，输出文件夹 {DEFAULT_CONFIG['output_dir']}，备份文件夹 {DEFAULT_CONFIG['backup_dir']}。
+    界面语言在首次运行时按系统界面语言确定，之后以配置文件为准。
+  • 输出文件夹、备份文件夹以 / 或 \\ 开头表示相对于程序运行目录（仅 Windows）。
+  • 命令行参数 --lang zh|en 可在启动时强制界面语言，配置文件不存在时同样有效。""",
+        f"""{Color.OKCYAN}[Config File]{Color.ENDC}
   - The config file is {CONFIG_FILENAME} next to the executable (or next to the script when
     run from source); it is read at startup and saved on exit.
   - If the file does not exist, a default config file is created at startup.
-  - Defaults: output mode Normal Mode, output folder /output, backup folder /backup-archive.
+  - Defaults: output mode Normal Mode, output folder {DEFAULT_CONFIG['output_dir']}, backup folder {DEFAULT_CONFIG['backup_dir']}.
     The language follows the system UI language on first run, and is stored in the config
     afterwards.
-  - A leading / or \\ in the output/backup folder means "relative to the program directory".
-{Color.OKCYAN}[Notes]{Color.ENDC}
+  - On Windows a leading / or \\ means "relative to the program directory"; on other
+    platforms a leading / is an ordinary absolute path.
+  - The --lang zh|en command-line option forces the UI language at startup, even before
+    a config file exists.""",
+    ),
+    # 注意事项
+    (
+        f"""{Color.OKCYAN}【注意事项】{Color.ENDC}
+  1. 仅支持 PNG 图片（RGBA 模式），背景色以左上角第一个像素为准。
+  2. 图片高度不得小于 1000 像素。低于该高度的是另一种面尾结构，不在处理范围内；
+     程序会把它们从本次处理中排除，其余文件照常处理。
+  3. 常规模式输出到输出文件夹，命名格式为：
+      原文件名-新d值px.png      （Stable模式）
+      原文件名-新d值px-lzr.png  （Lazer 模式）
+      若选择"不添加后缀"，则仅使用 原文件名.png。
+     替换模式下结果直接覆盖原文件，文件名保持不变。
+  4. 使用替换模式前请确认重要文件已备份；同一批次只保留最初版本的原文件。
+  5. 如果原图不符合预期结构（例如找不到面尾/面身），程序会报错并返回菜单。
+  6. 本程序暂不支持渐变颜色面身、非单一颜色或含有图案面身的皮肤。
+  7. 输入文件夹路径时会批处理该目录下所有 .png 文件（不递归子目录）。
+  8. 如果你遇到任何问题，请在GitHub仓库上提交issue或联系作者。""",
+        f"""{Color.OKCYAN}[Notes]{Color.ENDC}
   1. PNG only (RGBA). Background color is the top-left pixel.
   2. Height must be at least 1000px. Shorter images are a different tail structure and
-     are out of scope; the tool lists them and returns to the path input.
+     are out of scope; the tool excludes them and still processes the rest.
   3. In Normal Mode, output goes to the output folder with filename format:
       original-name-dpx.png       (Stable)
       original-name-dpx-lzr.png   (Lazer)
@@ -849,96 +1017,56 @@ def print_help():
   5. If the image structure is invalid (e.g., tail/body not found), the tool returns to menu.
   6. Gradient or patterned note bodies are not supported currently.
   7. Inputting a directory path will batch all .png files in that folder (non-recursive).
-  8. If you encounter issues, open an issue on GitHub or contact the author.
-{Color.BOLD}{Color.OKGREEN}======================================{Color.ENDC}
-"""
-    else:
-        help_text = f"""
-{Color.BOLD}{Color.OKGREEN}========== 帮助信息 =========={Color.ENDC}
-{Color.OKCYAN}【什么是投皮】{Color.ENDC}
-  • 投皮是一个将面身拉伸到上万像素长，随后通过顶部截断的方式来制造视觉上的短尾效果。
-  • 在高密度LN中，玩家通常会使用投皮来获得更好的视觉反馈和操作体验。
-  • 投皮往往能够大幅减轻读谱压力，但是无法精确地找到松手位置。
-  • 我们约定，一个皮肤顶部截断了多少像素(即第一个非背景色像素到顶部的距离)，称为"投机取巧程度"或"投了多少像素"。
-  • 在本程序中，使用 d 来代替这个值。
-{Color.OKCYAN}【模式说明】{Color.ENDC}
-  • Stable 模式 : 直接设置新的 d 值，程序自动移动面尾和面身。
-  • Lazer 模式 : 根据我的测定，26年初的lazer版本会使皮肤错误拉伸。大致为stb+75px。
-                因此，该模式下输入的任何数据都会被-75px，下限为0.
-                另外，为防止过度拉伸，所有图片长度将被固定在32800px。
-{Color.OKCYAN}【输出模式说明】{Color.ENDC}
-  • 常规模式 : 默认模式。处理结果输出到输出文件夹（默认 /output），不改动原文件。
-  • 替换模式 : 处理前先把所选原文件复制到备份文件夹（默认 /backup-archive）下的
-              [备份时间戳] 子文件夹，随后用处理结果替换原文件。
-              同一批处理的文件共用同一个时间戳文件夹，提示中给出的就是实际创建的路径。
-{Color.OKCYAN}【菜单说明】{Color.ENDC}
-  菜单为单键触发：按一个键立即执行，无需回车。
-  • ? - 帮助 : 显示本说明页（半角 ? 与全角 ？ 均可触发）。
-  • 0 - 重置默认配置 : 把输出模式、输出文件夹、备份文件夹、语言恢复为默认值；
-                       输出模式与文件夹立即生效，界面语言在重启后切换。
-  • 1 - 切换模式 : 在 Stable 和 Lazer 之间切换。注意 Lazer 模式下 d 最小为 75。
-  • 2 - 查看当前投机取巧程度 : 单图模式显示该图的 d；目录模式会逐张列出所有已选图片的 d。
-  • 3 - 修改投机取巧程度 :
-        单图模式会输出 1 张结果图；目录模式会对已选文件进行同一 d 的批处理。
-        常规模式下输入 d 值后可选择是否为输出文件名添加后缀，随后会再确认一次；
-        替换模式下文件名不变，因此不再询问后缀。
-        替换模式在确认前会用醒目红色警告提示将覆盖原文件。
-  • 4 - 单图批量生成 :
-        仅单图模式可用。输入起始值、终止值、步长生成列表后，会按其逐个生成多张图。
-        步长不能为 0；若数量较多会再次提示确认。
-        替换模式下多次生成共用同一个备份时间戳，备份只保留最初的原文件。
-  • 5 - 模式修复功能 :
-      Lazer 模式显示为“图片拉伸修复”，会执行 Lazer 标准化（固定到 32800px）。
-      Stable 模式显示为“修复面尾白线”，会执行 Stable 标准化（超过 32767px 时裁切并清空末行）。
-  • 6 - 调整输出模式 : 在 常规模式 与 替换模式 之间切换；菜单上方始终显示当前输出模式。
-  • 7 - 调整输出/备份文件夹 : 先选择“输出文件夹”还是“备份文件夹”，再输入新路径；
-       留空（直接回车）即可返回上级菜单。
-  • 8 - 更换图片 : 重新选择单个 PNG 或文件夹路径。
-  • 9 - 检查更新 : 从 GitHub 获取最新发布版本信息。
-  • L - 语言/Language : 切换界面语言（中文 / English）；留空（直接回车）即可返回上级菜单，
-        设置会保存到配置文件。
-  • Q - 退出 : 保存配置并关闭程序。
-{Color.OKCYAN}【选择文件夹时】{Color.ENDC}
-  选择文件夹后，程序会先列出命名匹配 mania-note[数字]L 或 NoteImage*L 的文件，
-  再让你选择修改范围：
-  • 1 - 仅修改上面列出的匹配文件
-  • 2 - 修改该目录下的全部图片文件
-  直接回车则返回路径输入。
-{Color.OKCYAN}【高度小于 1000px 的图片】{Color.ENDC}
-  这类图片不在本程序的处理范围内：它们通常是另一种面尾结构，而不是使用 Repeat 模式的
-  面身文件，对它们做纵向复制并不能产生有效结果。程序会列出这些文件并说明原因，
-  然后返回路径输入，不会对任何文件做改动。
-{Color.OKCYAN}【配置文件】{Color.ENDC}
-  • 配置文件为 exe（源码运行时为脚本）所在目录下的 {CONFIG_FILENAME}，启动时读取、退出时保存。
-  • 若该文件不存在，启动时会自动创建默认配置文件。
-  • 默认值：输出模式 常规模式，输出文件夹 /output，备份文件夹 /backup-archive。
-    界面语言在首次运行时按系统界面语言确定，之后以配置文件为准。
-  • 输出文件夹、备份文件夹以 / 或 \\ 开头表示相对于程序运行目录。
-{Color.OKCYAN}【注意事项】{Color.ENDC}
-  1. 仅支持 PNG 图片（RGBA 模式），背景色以左上角第一个像素为准。
-  2. 图片高度不得小于 1000 像素。低于该高度的是另一种面尾结构，不在处理范围内；
-     程序会列出这些文件并返回路径输入。
-  3. 常规模式输出到输出文件夹，命名格式为：
-      原文件名-新d值px.png      （Stable模式）
-      原文件名-新d值px-lzr.png  （Lazer 模式）
-      若选择"不添加后缀"，则仅使用 原文件名.png。
-     替换模式下结果直接覆盖原文件，文件名保持不变。
-  4. 使用替换模式前请确认重要文件已备份；同一批次只保留最初版本的原文件。
-  5. 如果原图不符合预期结构（例如找不到面尾/面身），程序会报错并返回菜单。
-  6. 本程序暂不支持渐变颜色面身、非单一颜色或含有图案面身的皮肤。
-  7. 输入文件夹路径时会批处理该目录下所有 .png 文件（不递归子目录）。
-  8. 如果你遇到任何问题，请在GitHub仓库上提交issue或联系作者。
-{Color.BOLD}{Color.OKGREEN}=============================={Color.ENDC}
-"""
-    print(help_text)
+  8. If you encounter issues, open an issue on GitHub or contact the author.""",
+    ),
+    # 结尾
+    (
+        f"{Color.BOLD}{Color.OKGREEN}=============================={Color.ENDC}",
+        f"{Color.BOLD}{Color.OKGREEN}======================================{Color.ENDC}",
+    ),
+)
+
+
+def print_help():
+    # 开头与结尾各留一个空行，保持原有的排版
+    print("\n" + "\n".join(t(zh_text, en_text) for zh_text, en_text in HELP_TEXT) + "\n")
     print(f"{Color.WARNING}{t('按任意键返回菜单...', 'Press any key to return to the menu...')}{Color.ENDC}", end='', flush=True)
     read_key()
 
 
 
+def parse_lang_arg(argv):
+    """解析命令行 --lang <zh|en>（也接受 --lang=zh）。
+
+    用于配置文件还不存在、或需要在脚本里强制界面语言的场景；设置会像菜单 L
+    一样写回配置文件。未给出该参数时返回 None。
+    """
+    for i, arg in enumerate(argv):
+        if arg == "--lang":
+            value = argv[i + 1] if i + 1 < len(argv) else ""
+        elif arg.startswith("--lang="):
+            value = arg.split("=", 1)[1]
+        else:
+            continue
+        value = value.strip().lower()
+        if value in LANGUAGES:
+            return value
+        raise LNImageError(t(
+            f"不支持的语言: {value or '(空)'}；可选 {', '.join(LANGUAGES)}",
+            f"Unsupported language: {value or '(empty)'}; choose from {', '.join(LANGUAGES)}"))
+    return None
+
+
 def main():
     global LANG
     cfg = config()
+    try:
+        forced_lang = parse_lang_arg(sys.argv[1:])
+    except LNImageError as e:
+        print(f"{Color.FAIL}{e}{Color.ENDC}")
+        return 1
+    if forced_lang is not None:
+        cfg["language"] = forced_lang
     LANG = cfg.get("language", DEFAULT_LANGUAGE)
     clear_screen()
     print(f"{Color.BOLD}{Color.HEADER}osu!mania {t('投皮调整工具', 'Percy Skin Editor')} - v{VERSION}{Color.ENDC}")
@@ -1255,7 +1383,13 @@ def main():
                 failed += f
                 errors.extend(err_list)
 
-            backup_label = os.path.join(get_backup_root(), batch_timestamp)
+            # 只有替换模式才有备份路径。这里必须按模式求值：batch_timestamp 在常规
+            # 模式下是 None，无条件 os.path.join 会抛 TypeError；而且 get_backup_root()
+            # 会顺带 makedirs，常规模式也会凭空多出一个空的 backup-archive/。
+            backup_label = (
+                os.path.join(get_backup_root(), batch_timestamp)
+                if active_mode == OUTPUT_MODE_REPLACE else None
+            )
             if failed == 0:
                 if active_mode == OUTPUT_MODE_REPLACE:
                     print(f"{Color.OKGREEN}{t('批量生成完成，共 ', 'Batch generation completed. ')}{success}{t(' 张。原文件已保存至 ', ' result(s) written. Originals saved to ')}{backup_label}{Color.ENDC}")
@@ -1304,7 +1438,12 @@ def main():
                     timestamp=fix_timestamp
                 )
 
-                backup_label = os.path.join(get_backup_root(), fix_timestamp)
+                # 同上：常规模式下 fix_timestamp 是 None，必须在 if 之前按模式求值，
+                # 否则 TypeError 会被下面的宽 except 吞掉、伪装成“修复失败”。
+                backup_label = (
+                    os.path.join(get_backup_root(), fix_timestamp)
+                    if active_mode == OUTPUT_MODE_REPLACE else None
+                )
                 if active_mode == OUTPUT_MODE_REPLACE:
                     if failed == 0:
                         print(f"{Color.OKGREEN}{fix_label}{t('完成，共 ', ' completed on ')}{success}{t(' 张。原文件已保存至 ', ' file(s). Originals saved to ')}{backup_label}{Color.ENDC}")
@@ -1324,7 +1463,8 @@ def main():
                         print(f"{Color.FAIL}{t('失败: ', 'Failed: ')}{src} -> {err}{Color.ENDC}")
                     print(f"{Color.OKGREEN}{t('成功输出目录: ', 'Successful outputs are in: ')}{get_output_dir()}{Color.ENDC}")
             except Exception as e:
-                print(f"{Color.FAIL}{fix_label}{t('失败: ', ' failed: ')}{e}{Color.ENDC}")
+                # 带上异常类型，避免程序缺陷被伪装成普通的“修复失败”
+                print(f"{Color.FAIL}{fix_label}{t('失败: ', ' failed: ')}{type(e).__name__}: {e}{Color.ENDC}")
             pause()
             clear_screen()
         elif choice == '6':
@@ -1459,7 +1599,7 @@ def main():
 
 if __name__ == "__main__":
     try:
-        main()
+        sys.exit(main())
     except KeyboardInterrupt:
         print(f"\n{Color.WARNING}{t('用户中断，程序退出。', 'Interrupted by user. Program exited.')}{Color.ENDC}")
     finally:
